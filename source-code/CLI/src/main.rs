@@ -2,17 +2,17 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use colored::*;
 use log::{error, info, LevelFilter};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use simplelog::{Config, TermLogger, WriteLogger};
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, Write};
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use toml;
 use walkdir::WalkDir;
 
 // Define the Profile struct based on TOML fields
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Deserialize, Serialize, Debug, Clone)]
 struct Profile {
     packages: Vec<String>,
     distro_name: String,
@@ -51,6 +51,8 @@ enum Commands {
     Settings,
     /// Interactive build mode
     ShowBuild,
+    /// Initialize a new project with example structure
+    Init,
 }
 
 fn main() -> Result<()> {
@@ -79,10 +81,9 @@ fn main() -> Result<()> {
     let scripts_dir = current_dir.join("scripts");
     let build_dir = current_dir.join("build/iso");
 
-    fs::create_dir_all(&build_dir).context("Failed to create build directory")?;
-
     match cli.command {
         Commands::Build { profile } => {
+            fs::create_dir_all(&build_dir).context("Failed to create build directory")?;
             build_distro(
                 &profiles_dir,
                 profile.as_deref(),
@@ -95,11 +96,46 @@ fn main() -> Result<()> {
         Commands::Tutorials => show_tutorials(),
         Commands::Settings => configure_settings()?,
         Commands::ShowBuild => {
+            fs::create_dir_all(&build_dir).context("Failed to create build directory")?;
             interactive_build(&profiles_dir, &files_dir, &scripts_dir, &build_dir)?;
         }
+        Commands::Init => init_project(&current_dir)?,
     }
 
     info!("ULB execution completed");
+    Ok(())
+}
+
+fn init_project(current_dir: &Path) -> Result<()> {
+    println!("{}", "Initializing project...".yellow());
+
+    fs::create_dir_all(current_dir.join("profiles")).context("Failed to create profiles dir")?;
+    fs::create_dir_all(current_dir.join("files")).context("Failed to create files dir")?;
+    fs::create_dir_all(current_dir.join("scripts")).context("Failed to create scripts dir")?;
+    fs::create_dir_all(current_dir.join("build/iso")).context("Failed to create build/iso dir")?;
+
+    let example_toml = r#"
+packages = ["vim", "git"]
+distro_name = "MyDistro"
+base = "ubuntu"
+version = "1.0"
+init_system = "systemd"
+packages_to_remove = []
+bootloader = "grub"
+uefi_support = true
+bios_support = true
+format = "iso"
+atomic = false
+"#;
+
+    let profile_path = current_dir.join("profiles/example.toml");
+    fs::write(&profile_path, example_toml).context("Failed to write example.toml")?;
+
+    println!("{}", "Project initialized with example profile!".green());
+    println!("Folders created: profiles, files, scripts, build/iso");
+    println!("Example profile: profiles/example.toml");
+    println!("You can now run 'ulb build example' to build.");
+
     Ok(())
 }
 
@@ -166,7 +202,7 @@ fn find_profile(profiles_dir: &Path, profile_name: Option<&str>) -> Result<PathB
     }
 
     if profiles.is_empty() {
-        return Err(anyhow::anyhow!("No profiles found in {}", profiles_dir.display()));
+        return Err(anyhow::anyhow!("No profiles found in {}. Run 'ulb init' to create an example.", profiles_dir.display()));
     }
 
     if let Some(name) = profile_name {
@@ -202,18 +238,22 @@ fn setup_podman_container(profile: &Profile) -> Result<()> {
     let base_image = match profile.base.as_str() {
         "ubuntu" | "debian" => "ubuntu:latest",
         "fedora" => "fedora:latest",
-        _ => "ubuntu:latest",
+        _ => return Err(anyhow::anyhow!("Unsupported base: {}. Supported: ubuntu, debian, fedora", profile.base)),
     };
-    Command::new("podman")
+    let output = Command::new("podman")
         .args(&["pull", base_image])
-        .status()
+        .output()
         .context("Failed to pull base image")?;
+    if !output.status.success() {
+        error!("Podman pull failed: {}", String::from_utf8_lossy(&output.stderr));
+        return Err(anyhow::anyhow!("Failed to pull image"));
+    }
 
     // Install required tools in container
     let tools = if profile.atomic {
-        vec!["ostree", "rpm-ostree", "xorriso"] // For atomic
+        vec!["ostree", "rpm-ostree", "xorriso", "mksquashfs"] // For atomic
     } else {
-        vec!["debootstrap", "live-build", "xorriso", "lorax"]
+        vec!["debootstrap", "live-build", "xorriso", "lorax", "mksquashfs"]
     };
 
     let pkg_manager = if profile.base == "fedora" { "dnf" } else { "apt" };
@@ -223,7 +263,7 @@ fn setup_podman_container(profile: &Profile) -> Result<()> {
         format!("dnf install -y {}", tools.join(" "))
     };
 
-    Command::new("podman")
+    let output = Command::new("podman")
         .args(&[
             "run",
             "--rm",
@@ -234,8 +274,12 @@ fn setup_podman_container(profile: &Profile) -> Result<()> {
             "-c",
             &install_cmd,
         ])
-        .status()
+        .output()
         .context("Failed to install tools in container")?;
+    if !output.status.success() {
+        error!("Tool installation failed: {}", String::from_utf8_lossy(&output.stderr));
+        return Err(anyhow::anyhow!("Failed to install tools"));
+    }
 
     info!("Podman container setup complete");
     Ok(())
@@ -244,59 +288,87 @@ fn setup_podman_container(profile: &Profile) -> Result<()> {
 fn install_base_system(profile: &Profile, rootfs: &Path) -> Result<()> {
     println!("{}", "Installing base system...".yellow());
 
+    let base_image = match profile.base.as_str() {
+        "ubuntu" | "debian" => "ubuntu:latest",
+        "fedora" => "fedora:latest",
+        _ => unreachable!(),
+    };
+
     let base_cmd = match profile.base.as_str() {
         "debian" | "ubuntu" => "debootstrap",
         "fedora" if profile.atomic => "rpm-ostree",
+        "fedora" => "dnf",
         _ => return Err(anyhow::anyhow!("Unsupported base: {}", profile.base)),
     };
 
-    // Example for debootstrap
-    if base_cmd == "debootstrap" {
-        Command::new("podman")
-            .args(&[
-                "run",
-                "--rm",
-                "-v",
-                &format!("{}:/rootfs:z", rootfs.display()),
-                "ubuntu:latest",
-                "debootstrap",
-                "--arch=amd64",
-                "stable",
-                "/rootfs",
-                "http://deb.debian.org/debian/",
-            ])
-            .status()
-            .context("Failed to run debootstrap")?;
-    } else if base_cmd == "rpm-ostree" {
-        // Placeholder for atomic
-        println!("{}", "Atomic base installation (placeholder)".cyan());
+    let install_cmd = match base_cmd {
+        "debootstrap" => {
+            format!("debootstrap --arch=amd64 stable /rootfs http://deb.debian.org/debian/")
+        }
+        "rpm-ostree" => {
+            // Placeholder for atomic Fedora
+            "rpm-ostree install --repo=/rootfs/ostree-repo base-packages".to_string()
+        }
+        "dnf" => {
+            format!("dnf install -y --installroot=/rootfs --releasever=latest @core")
+        }
+        _ => unreachable!(),
+    };
+
+    let output = Command::new("podman")
+        .args(&[
+            "run",
+            "--rm",
+            "--privileged",  // May need for some installs
+            "-v",
+            &format!("{}:/rootfs:z", rootfs.display()),
+            base_image,
+            "bash",
+            "-c",
+            &install_cmd,
+        ])
+        .output()
+        .context("Failed to run base install")?;
+    if !output.status.success() {
+        error!("Base install failed: {}", String::from_utf8_lossy(&output.stderr));
+        return Err(anyhow::anyhow!("Base system installation failed"));
     }
 
     Ok(())
 }
 
 fn install_packages(profile: &Profile, rootfs: &Path) -> Result<()> {
-    println!("{}", "Installing packages...".yellow());
-
     if !profile.packages.is_empty() {
+        println!("{}", "Installing packages...".yellow());
+
+        let base_image = match profile.base.as_str() {
+            "ubuntu" | "debian" => "ubuntu:latest",
+            "fedora" => "fedora:latest",
+            _ => unreachable!(),
+        };
+
         let pkg_manager = if profile.base == "fedora" { "dnf" } else { "apt" };
         let install_cmd = format!("{} install -y {}", pkg_manager, profile.packages.join(" "));
 
-        Command::new("podman")
+        let output = Command::new("podman")
             .args(&[
                 "run",
                 "--rm",
                 "-v",
                 &format!("{}:/rootfs:z", rootfs.display()),
-                "ubuntu:latest",  // Adjust if fedora
+                base_image,
                 "chroot",
                 "/rootfs",
                 "bash",
                 "-c",
                 &install_cmd,
             ])
-            .status()
+            .output()
             .context("Failed to install packages")?;
+        if !output.status.success() {
+            error!("Package install failed: {}", String::from_utf8_lossy(&output.stderr));
+            return Err(anyhow::anyhow!("Package installation failed"));
+        }
     }
 
     Ok(())
@@ -305,24 +377,35 @@ fn install_packages(profile: &Profile, rootfs: &Path) -> Result<()> {
 fn remove_packages(profile: &Profile, rootfs: &Path) -> Result<()> {
     if !profile.packages_to_remove.is_empty() {
         println!("{}", "Removing packages...".yellow());
+
+        let base_image = match profile.base.as_str() {
+            "ubuntu" | "debian" => "ubuntu:latest",
+            "fedora" => "fedora:latest",
+            _ => unreachable!(),
+        };
+
         let pkg_manager = if profile.base == "fedora" { "dnf" } else { "apt" };
         let remove_cmd = format!("{} remove -y {}", pkg_manager, profile.packages_to_remove.join(" "));
 
-        Command::new("podman")
+        let output = Command::new("podman")
             .args(&[
                 "run",
                 "--rm",
                 "-v",
                 &format!("{}:/rootfs:z", rootfs.display()),
-                "ubuntu:latest",
+                base_image,
                 "chroot",
                 "/rootfs",
                 "bash",
                 "-c",
                 &remove_cmd,
             ])
-            .status()
+            .output()
             .context("Failed to remove packages")?;
+        if !output.status.success() {
+            error!("Package remove failed: {}", String::from_utf8_lossy(&output.stderr));
+            return Err(anyhow::anyhow!("Package removal failed"));
+        }
     }
     Ok(())
 }
@@ -332,12 +415,12 @@ fn copy_files(src_dir: &Path, dest_dir: &Path) -> Result<()> {
         println!("{}", "Copying files...".yellow());
         for entry in WalkDir::new(src_dir) {
             let entry = entry.context("Failed to walk dir")?;
-            let relative = entry.path().strip_prefix(src_dir).unwrap();
+            let relative = entry.path().strip_prefix(src_dir).context("Failed to strip prefix")?;
             let dest = dest_dir.join(relative);
             if entry.file_type().is_dir() {
                 fs::create_dir_all(&dest).context("Failed to create dir")?;
             } else {
-                fs::copy(entry.path(), &dest).context("Failed to copy file")?;
+                fs::copy(entry.path(), &dest).context(format!("Failed to copy file {}", entry.path().display()))?;
             }
         }
     }
@@ -356,9 +439,11 @@ fn run_scripts(scripts_dir: &Path, rootfs: &Path) -> Result<()> {
         // Sort scripts alphabetically to ensure consistent order
         scripts.sort_by_key(|e| e.file_name());
 
+        let base_image = "ubuntu:latest"; // Adjust if needed
+
         for entry in scripts {
             info!("Running script: {}", entry.path().display());
-            Command::new("podman")
+            let output = Command::new("podman")
                 .args(&[
                     "run",
                     "--rm",
@@ -366,14 +451,18 @@ fn run_scripts(scripts_dir: &Path, rootfs: &Path) -> Result<()> {
                     &format!("{}:/rootfs:z", rootfs.display()),
                     "-v",
                     &format!("{}:/script.sh:z,ro", entry.path().display()),
-                    "ubuntu:latest",
+                    base_image,
                     "chroot",
                     "/rootfs",
                     "bash",
                     "/script.sh",
                 ])
-                .status()
+                .output()
                 .context(format!("Failed to run script: {}", entry.path().display()))?;
+            if !output.status.success() {
+                error!("Script failed: {}", String::from_utf8_lossy(&output.stderr));
+                return Err(anyhow::anyhow!("Script execution failed"));
+            }
         }
     }
     Ok(())
@@ -382,31 +471,36 @@ fn run_scripts(scripts_dir: &Path, rootfs: &Path) -> Result<()> {
 fn configure_system(profile: &Profile, rootfs: &Path) -> Result<()> {
     println!("{}", "Configuring system...".yellow());
 
+    let base_image = match profile.base.as_str() {
+        "ubuntu" | "debian" => "ubuntu:latest",
+        "fedora" => "fedora:latest",
+        _ => unreachable!(),
+    };
+
     // Configure init system
-    match profile.init_system.as_str() {
-        "systemd" => {
-            // Enable systemd
-            Command::new("podman")
-                .args(&[
-                    "run",
-                    "--rm",
-                    "-v",
-                    &format!("{}:/rootfs:z", rootfs.display()),
-                    "ubuntu:latest",
-                    "chroot",
-                    "/rootfs",
-                    "systemctl",
-                    "enable",
-                    "systemd-sysv-install",
-                ])
-                .status()
-                .context("Failed to configure systemd")?;
-        }
-        "openrc" => {
-            // Placeholder
-            println!("{}", "OpenRC configuration (placeholder)".cyan());
-        }
-        _ => error!("Unsupported init system: {}", profile.init_system),
+    let init_cmd = match profile.init_system.as_str() {
+        "systemd" => "systemctl enable systemd-sysv-install",
+        "openrc" => "rc-update add ...", // Placeholder
+        _ => return Err(anyhow::anyhow!("Unsupported init system: {}", profile.init_system)),
+    };
+
+    let output = Command::new("podman")
+        .args(&[
+            "run",
+            "--rm",
+            "-v",
+            &format!("{}:/rootfs:z", rootfs.display()),
+            base_image,
+            "chroot",
+            "/rootfs",
+            "bash",
+            "-c",
+            init_cmd,
+        ])
+        .output()
+        .context("Failed to configure init")?;
+    if !output.status.success() {
+        error!("Init config failed: {}", String::from_utf8_lossy(&output.stderr));
     }
 
     // Configure bootloader
@@ -416,27 +510,57 @@ fn configure_system(profile: &Profile, rootfs: &Path) -> Result<()> {
         _ => return Err(anyhow::anyhow!("Unsupported bootloader: {}", profile.bootloader)),
     };
 
-    Command::new("podman")
+    let output = Command::new("podman")
         .args(&[
             "run",
             "--rm",
+            "--privileged",
             "-v",
             &format!("{}:/rootfs:z", rootfs.display()),
-            "ubuntu:latest",
+            base_image,
             "chroot",
             "/rootfs",
             "bash",
             "-c",
             bootloader_cmd,
         ])
-        .status()
+        .output()
         .context("Failed to install bootloader")?;
+    if !output.status.success() {
+        error!("Bootloader install failed: {}", String::from_utf8_lossy(&output.stderr));
+        return Err(anyhow::anyhow!("Bootloader configuration failed"));
+    }
 
     // Handle UEFI/BIOS support
     if !profile.uefi_support && !profile.bios_support {
         return Err(anyhow::anyhow!("Must support at least UEFI or BIOS"));
     }
-    // Additional config if needed
+    // Additional config if needed, e.g., generate initramfs
+
+    let mkinit_cmd = if profile.base == "fedora" {
+        "dracut -f /boot/initramfs.img"
+    } else {
+        "update-initramfs -u"
+    };
+
+    let output = Command::new("podman")
+        .args(&[
+            "run",
+            "--rm",
+            "-v",
+            &format!("{}:/rootfs:z", rootfs.display()),
+            base_image,
+            "chroot",
+            "/rootfs",
+            "bash",
+            "-c",
+            mkinit_cmd,
+        ])
+        .output()
+        .context("Failed to generate initramfs")?;
+    if !output.status.success() {
+        error!("Initramfs failed: {}", String::from_utf8_lossy(&output.stderr));
+    }
 
     Ok(())
 }
@@ -445,30 +569,44 @@ fn build_iso(profile: &Profile, rootfs: &Path, build_dir: &Path) -> Result<()> {
     println!("{}", "Building ISO...".yellow());
 
     let iso_path = build_dir.join(format!("{}-{}.iso", profile.distro_name, profile.version));
+    let tmp_output = PathBuf::from("/tmp/.ulb/output.iso");
 
-    let build_cmd = if profile.atomic {
-        // Placeholder for atomic build, e.g., rpm-ostree compose
-        "rpm-ostree compose tree --repo=/rootfs/ostree-repo /rootfs/tree.yaml && xorriso -as mkisofs -o /output.iso /rootfs"
-    } else {
-        // For classic, use live-build or mksquashfs + xorriso
-        "mksquashfs /rootfs /filesystem.squashfs && xorriso -as mkisofs -o /output.iso -b isolinux/isolinux.bin -c isolinux/boot.cat -no-emul-boot -boot-load-size 4 -boot-info-table -eltorito-alt-boot -e boot/efi.img -no-emul-boot /rootfs"
+    let base_image = match profile.base.as_str() {
+        "ubuntu" | "debian" => "ubuntu:latest",
+        "fedora" => "fedora:latest",
+        _ => unreachable!(),
     };
 
-    Command::new("podman")
+    let build_cmd = if profile.atomic {
+        // Placeholder for atomic build
+        "rpm-ostree compose tree --repo=/rootfs/ostree-repo /rootfs/tree.yaml && mksquashfs /rootfs /filesystem.squashfs -comp xz && xorriso -as mkisofs -o /output.iso -V 'MyDistro' -e /filesystem.squashfs -no-emul-boot /rootfs"
+    } else {
+        // For classic, use mksquashfs + xorriso
+        "mksquashfs /rootfs /filesystem.squashfs -comp xz && xorriso -as mkisofs -o /output.iso -b isolinux/isolinux.bin -c isolinux/boot.cat -no-emul-boot -boot-load-size 4 -boot-info-table -eltorito-alt-boot -e boot/efi.img -no-emul-boot -V 'MyDistro' /rootfs"
+    };
+
+    let output = Command::new("podman")
         .args(&[
             "run",
             "--rm",
+            "--privileged",
             "-v",
             &format!("{}:/rootfs:z", rootfs.display()),
             "-v",
-            &format!("{}:/output.iso:z", iso_path.display()),
-            "ubuntu:latest",
+            &format!("{}:/output.iso:z", tmp_output.display()),
+            base_image,
             "bash",
             "-c",
             build_cmd,
         ])
-        .status()
+        .output()
         .context("Failed to build ISO")?;
+    if !output.status.success() {
+        error!("ISO build failed: {}", String::from_utf8_lossy(&output.stderr));
+        return Err(anyhow::anyhow!("ISO build failed"));
+    }
+
+    fs::rename(&tmp_output, &iso_path).context("Failed to move ISO")?;
 
     info!("ISO built at {}", iso_path.display());
     Ok(())
@@ -486,29 +624,33 @@ fn clean_tmp() -> Result<()> {
 
 fn show_tutorials() {
     println!("{}", "Tutorials:".blue());
-    println!("1. Create a profile.toml in /profiles with fields:");
+    println!("1. Run 'ulb init' to create project structure.");
+    println!("2. Edit profiles/*.toml with your settings.");
+    println!("   Fields:");
     println!("   - packages: list of packages to install");
     println!("   - distro_name: name of your distro");
-    println!("   - base: base distro (e.g., ubuntu, fedora)");
+    println!("   - base: base distro (ubuntu, debian, fedora)");
     println!("   - version: version string");
     println!("   - init_system: systemd or openrc");
     println!("   - packages_to_remove: list to remove");
     println!("   - bootloader: grub or systemd-boot");
     println!("   - uefi_support: true/false");
     println!("   - bios_support: true/false");
-    println!("   - format: iso");
-    println!("   - atomic: true for atomic, false for classic");
-    println!("2. Add files to /files to overlay on /");
-    println!("3. Add executable .sh scripts to /scripts (run in order)");
-    println!("4. Run 'ulb build' or 'ulb build profile_name'");
-    println!("For atomic distros, use fedora base and set atomic=true.");
+    println!("   - format: iso (only supported)");
+    println!("   - atomic: true for atomic (fedora only), false for classic");
+    println!("3. Add files to /files to overlay on rootfs /");
+    println!("4. Add .sh scripts to /scripts (executed in alphabetical order post-install)");
+    println!("5. Run 'ulb build' or 'ulb build profile_name'");
+    println!("6. Output ISO in build/iso");
+    println!("7. Use 'ulb clean' to clean /tmp/.ulb");
+    println!("8. 'ulb show-build' for interactive mode");
 }
 
 fn configure_settings() -> Result<()> {
     println!("{}", "Settings:".blue());
     println!("Current language: English");
-    println!("To change language (future feature): select from menu.");
-    // Placeholder for settings, e.g., language
+    println!("Future features: language selection, custom themes.");
+    // Placeholder, could add config file in future
     Ok(())
 }
 
@@ -519,25 +661,29 @@ fn interactive_build(
     build_dir: &Path,
 ) -> Result<()> {
     println!("{}", "Interactive Build Mode".blue());
-    println!("Answer questions to create a profile. Type 'back' to go back.");
+    println!("Answer questions to create a profile. Type 'back' to retry question.");
 
     let mut profile = Profile {
-        distro_name: prompt("Distro name: ")?,
+        distro_name: prompt("Distro name (e.g., MyDistro): ")?,
         base: prompt("Base (ubuntu, debian, fedora): ")?,
-        version: prompt("Version: ")?,
+        version: prompt("Version (e.g., 1.0): ")?,
         init_system: prompt("Init system (systemd, openrc): ")?,
         bootloader: prompt("Bootloader (grub, systemd-boot): ")?,
         uefi_support: prompt_bool("UEFI support? (y/n): ")?,
         bios_support: prompt_bool("BIOS support? (y/n): ")?,
         format: "iso".to_string(),
-        atomic: prompt_bool("Atomic distro? (y/n): ")?,
-        packages: prompt_list("Packages to install (comma-separated): ")?,
+        atomic: prompt_bool("Atomic distro? (y/n, recommended for fedora): ")?,
+        packages: prompt_list("Packages to install (comma-separated, e.g., vim,git): ")?,
         packages_to_remove: prompt_list("Packages to remove (comma-separated): ")?,
     };
 
-    // Validate
-    if profile.base == "fedora" && !profile.atomic {
-        println!("{}", "Warning: Fedora recommended for atomic.".yellow());
+    // Basic validation
+    if profile.base != "ubuntu" && profile.base != "debian" && profile.base != "fedora" {
+        return Err(anyhow::anyhow!("Invalid base: {}", profile.base));
+    }
+    if profile.atomic && profile.base != "fedora" {
+        println!("{}", "Warning: Atomic supported only for fedora.".yellow());
+        profile.atomic = false;
     }
 
     // Save to temp TOML
@@ -562,21 +708,33 @@ fn prompt(question: &str) -> Result<String> {
         io::stdin()
             .read_line(&mut input)
             .context("Failed to read line")?;
-        let trimmed = input.trim();
+        let trimmed = input.trim().to_string();
         if trimmed == "back" {
-            // Handle back, but for simplicity, just reprompt
             continue;
         }
-        return Ok(trimmed.to_string());
+        if trimmed.is_empty() {
+            println!("{}", "Input cannot be empty.".red());
+            continue;
+        }
+        return Ok(trimmed);
     }
 }
 
 fn prompt_bool(question: &str) -> Result<bool> {
-    let answer = prompt(question)?;
-    Ok(answer.to_lowercase() == "y")
+    loop {
+        let answer = prompt(question)?;
+        match answer.to_lowercase().as_str() {
+            "y" => return Ok(true),
+            "n" => return Ok(false),
+            _ => println!("{}", "Please answer y or n.".red()),
+        }
+    }
 }
 
 fn prompt_list(question: &str) -> Result<Vec<String>> {
     let input = prompt(question)?;
-    Ok(input.split(',').map(|s| s.trim().to_string()).collect())
+    if input.is_empty() {
+        return Ok(vec![]);
+    }
+    Ok(input.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
 }
