@@ -9,7 +9,7 @@ INSTALL_SCRIPT_URL="https://raw.githubusercontent.com/michal92299/Universal-Live
 # Funkcja: pobierz lokalną wersję ulb
 get_local_version() {
     if command -v ulb >/dev/null 2>&1; then
-        ulb version
+        ulb --version
     else
         echo "none"
     fi
