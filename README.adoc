@@ -46,7 +46,35 @@ WARNING: ULB używa uprzywilejowanych kontenerów (`--privileged`) do instalacji
 
 == Instalacja
 === Instalacja binarki
+. Pobierz skrypt instalacyjny:
++
+[source, bash]
+----
+curl -L "https://raw.githubusercontent.com/michal92299/Universal-Live-Builder/refs/heads/main/install.sh" -o /tmp/install.sh
+----
 
+. Daj uprawnienia:
++
+[source, bash]
+----
+sudo chmod a+x /tmp/install.sh
+----
+
+. Uruchom:
++
+[source, bash]
+----
+/tmp/install.sh
+----
+
+. Sprawdź instalację:
++
+[source, bash]
+----
+ulb --version
+----
++
+Oczekiwany output: `Universal Live Builder 0.1.0`
 === Budowanie ze zródeł
 Instalacja ULB jest prosta i zajmuje kilka minut:
 
